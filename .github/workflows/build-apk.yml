@@ -16,11 +16,23 @@ jobs:
             unzip -o "$f"
           done
 
-      - name: Fix Java/Kotlin JVM target
+      - name: Update Gradle and Manifest
         run: |
-          cat >> app/build.gradle.kts << 'EOF'
-
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
           android {
+              namespace = "com.warehouse.alert"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.warehouse.alert"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 2
+                  versionName = "2.0"
+              }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
@@ -29,6 +41,510 @@ jobs:
           tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
               compilerOptions {
                   jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+              }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar"
+                  android:label="Warehouse Alert"
+                  android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Write QR Chat and Call App
+        run: |
+          rm -f app/src/main/java/com/warehouse/alert/ListenerService.kt
+          cat > app/src/main/java/com/warehouse/alert/MainActivity.kt << 'EOF'
+          package com.warehouse.alert
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import com.google.zxing.BarcodeFormat
+          import com.google.zxing.integration.android.IntentIntegrator
+          import com.journeyapps.barcodescanner.BarcodeEncoder
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.io.PrintWriter
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.util.concurrent.CopyOnWriteArrayList
+
+          class MainActivity : AppCompatActivity() {
+              private val chatPort = 45455
+              private val voicePort = 45456
+
+              private lateinit var setupLayout: LinearLayout
+              private lateinit var connectedLayout: LinearLayout
+              private lateinit var usernameInput: EditText
+              private lateinit var statusText: TextView
+              private lateinit var chatLog: TextView
+              private lateinit var chatScroll: ScrollView
+              private lateinit var msgInput: EditText
+              private lateinit var showQrBtn: Button
+              private lateinit var callBtn: Button
+
+              private var isHost = false
+              private var username = "User"
+              private var hostIp = ""
+              @Volatile private var connected = false
+              @Volatile private var inCall = false
+
+              private var chatServer: ServerSocket? = null
+              private var voiceServer: ServerSocket? = null
+              private var clientChatSocket: Socket? = null
+              private var clientChatOut: PrintWriter? = null
+              private var clientVoiceSocket: Socket? = null
+
+              private val hostChatClients = CopyOnWriteArrayList<PrintWriter>()
+              private val hostVoiceClients = CopyOnWriteArrayList<Socket>()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 48, 32, 32)
+                  }
+
+                  // --- SETUP SCREEN ---
+                  setupLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  setupLayout.addView(TextView(this).apply {
+                      text = "WAREHOUSE CONNECT"
+                      textSize = 24f
+                      setTextColor(Color.BLACK)
+                  })
+                  setupLayout.addView(TextView(this).apply {
+                      text = "Enter your name, then Host (QR) or Scan QR to connect."
+                      setPadding(0, 8, 0, 24)
+                  })
+
+                  usernameInput = EditText(this).apply {
+                      hint = "Enter your username (e.g. Supervisor)"
+                      setSingleLine(true)
+                  }
+                  setupLayout.addView(usernameInput)
+
+                  val hostBtn = Button(this).apply { text = "START AS HOST (SHOW QR)" }
+                  val scanBtn = Button(this).apply { text = "SCAN QR TO CONNECT" }
+                  setupLayout.addView(hostBtn)
+                  setupLayout.addView(scanBtn)
+
+                  // --- CONNECTED SCREEN ---
+                  connectedLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = View.GONE
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.MATCH_PARENT
+                      )
+                  }
+
+                  statusText = TextView(this).apply {
+                      textSize = 15f
+                      setTextColor(Color.parseColor("#1B5E20"))
+                      setPadding(0, 0, 0, 12)
+                  }
+                  connectedLayout.addView(statusText)
+
+                  val topBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  showQrBtn = Button(this).apply { text = "SHOW QR" }
+                  callBtn = Button(this).apply { text = "START CALL" }
+                  val disconnectBtn = Button(this).apply {
+                      text = "DISCONNECT"
+                      setTextColor(Color.RED)
+                  }
+                  topBar.addView(showQrBtn)
+                  topBar.addView(callBtn)
+                  topBar.addView(disconnectBtn)
+                  connectedLayout.addView(topBar)
+
+                  chatScroll = ScrollView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
+                      setBackgroundColor(Color.parseColor("#F5F5F5"))
+                      setPadding(16, 16, 16, 16)
+                  }
+                  chatLog = TextView(this).apply {
+                      textSize = 15f
+                      setTextColor(Color.BLACK)
+                  }
+                  chatScroll.addView(chatLog)
+                  connectedLayout.addView(chatScroll)
+
+                  val inputBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, 12, 0, 0)
+                  }
+                  msgInput = EditText(this).apply {
+                      hint = "Type a message..."
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  val sendBtn = Button(this).apply { text = "SEND" }
+                  inputBar.addView(msgInput)
+                  inputBar.addView(sendBtn)
+                  connectedLayout.addView(inputBar)
+
+                  root.addView(setupLayout)
+                  root.addView(connectedLayout)
+                  setContentView(root)
+
+                  // --- BUTTON ACTIONS ---
+                  hostBtn.setOnClickListener {
+                      username = usernameInput.text.toString().trim().ifEmpty { "Host" }
+                      val ip = getLocalIpAddress()
+                      if (ip == null) {
+                          Toast.makeText(this, "Connect to Wi-Fi first", Toast.LENGTH_LONG).show()
+                          return@setOnClickListener
+                      }
+                      hostIp = ip
+                      startHost()
+                  }
+
+                  scanBtn.setOnClickListener {
+                      username = usernameInput.text.toString().trim().ifEmpty { "Associate" }
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                          ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 101)
+                          return@setOnClickListener
+                      }
+                      IntentIntegrator(this).apply {
+                          setPrompt("Scan the Host QR Code")
+                          setBeepEnabled(true)
+                          setOrientationLocked(true)
+                          initiateScan()
+                      }
+                  }
+
+                  showQrBtn.setOnClickListener { showQrDialog() }
+
+                  sendBtn.setOnClickListener {
+                      val text = msgInput.text.toString().trim()
+                      if (text.isEmpty()) return@setOnClickListener
+                      msgInput.setText("")
+                      sendChatMessage("$username: $text")
+                  }
+
+                  callBtn.setOnClickListener {
+                      if (!inCall) {
+                          if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                              ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 102)
+                              return@setOnClickListener
+                          }
+                          startVoiceCall()
+                      } else {
+                          stopVoiceCall()
+                      }
+                  }
+
+                  disconnectBtn.setOnClickListener { disconnectAll() }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  val result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
+                  if (result != null && result.contents != null) {
+                      val parts = result.contents.split("|")
+                      if (parts.size >= 2 && parts[0] == "WHALERT") {
+                          hostIp = parts[1]
+                          connectToHost(hostIp)
+                      } else {
+                          Toast.makeText(this, "Invalid QR Code", Toast.LENGTH_SHORT).show()
+                      }
+                  } else {
+                      super.onActivityResult(requestCode, resultCode, data)
+                  }
+              }
+
+              private fun startHost() {
+                  isHost = true
+                  connected = true
+                  showConnectedUi("HOST: $username ($hostIp)", showQr = true)
+                  appendLog("--- Hosting on $hostIp ---")
+                  showQrDialog()
+
+                  // Chat server
+                  Thread {
+                      try {
+                          val server = ServerSocket(chatPort)
+                          chatServer = server
+                          while (connected) {
+                              val sock = server.accept()
+                              val out = PrintWriter(sock.getOutputStream(), true)
+                              hostChatClients.add(out)
+                              Thread {
+                                  try {
+                                      val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
+                                      var line: String?
+                                      while (connected && reader.readLine().also { line = it } != null) {
+                                          val msg = line!!
+                                          appendLog(msg)
+                                          broadcastToClients(msg, out)
+                                      }
+                                  } catch (_: Exception) {
+                                  } finally {
+                                      hostChatClients.remove(out)
+                                      try { sock.close() } catch (_: Exception) {}
+                                  }
+                              }.start()
+                          }
+                      } catch (_: Exception) {}
+                  }.start()
+
+                  // Voice relay server
+                  Thread {
+                      try {
+                          val vServer = ServerSocket(voicePort)
+                          voiceServer = vServer
+                          while (connected) {
+                              val sock = vServer.accept()
+                              hostVoiceClients.add(sock)
+                              Thread {
+                                  try {
+                                      val input = sock.getInputStream()
+                                      val buf = ByteArray(1024)
+                                      while (connected) {
+                                          val n = input.read(buf)
+                                          if (n <= 0) break
+                                          for (peer in hostVoiceClients) {
+                                              if (peer != sock) {
+                                                  try { peer.getOutputStream().write(buf, 0, n) } catch (_: Exception) {}
+                                              }
+                                          }
+                                      }
+                                  } catch (_: Exception) {
+                                  } finally {
+                                      hostVoiceClients.remove(sock)
+                                      try { sock.close() } catch (_: Exception) {}
+                                  }
+                              }.start()
+                          }
+                      } catch (_: Exception) {}
+                  }.start()
+              }
+
+              private fun connectToHost(ip: String) {
+                  isHost = false
+                  Thread {
+                      try {
+                          val sock = Socket(ip, chatPort)
+                          clientChatSocket = sock
+                          clientChatOut = PrintWriter(sock.getOutputStream(), true)
+                          connected = true
+                          runOnUiThread {
+                              showConnectedUi("Connected: $username -> $ip", showQr = false)
+                              appendLog("--- Connected to $ip ---")
+                          }
+                          clientChatOut?.println("*** $username joined ***")
+                          val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
+                          var line: String?
+                          while (connected && reader.readLine().also { line = it } != null) {
+                              appendLog(line!!)
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread {
+                              Toast.makeText(this, "Connection failed: ${e.message}", Toast.LENGTH_LONG).show()
+                              disconnectAll()
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun sendChatMessage(formatted: String) {
+                  appendLog(formatted)
+                  Thread {
+                      if (isHost) {
+                          broadcastToClients(formatted, null)
+                      } else {
+                          clientChatOut?.println(formatted)
+                      }
+                  }.start()
+              }
+
+              private fun broadcastToClients(msg: String, exclude: PrintWriter?) {
+                  for (client in hostChatClients) {
+                      if (client != exclude) {
+                          try { client.println(msg) } catch (_: Exception) {}
+                      }
+                  }
+              }
+
+              private fun startVoiceCall() {
+                  inCall = true
+                  callBtn.text = "END CALL"
+                  callBtn.setTextColor(Color.parseColor("#D32F2F"))
+                  appendLog("*** $username started voice call ***")
+                  if (!isHost) Thread { clientChatOut?.println("*** $username joined voice call ***") }.start()
+
+                  Thread {
+                      val sampleRate = 8000
+                      val recBufSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(1024)
+                      val playBufSize = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(1024)
+
+                      try {
+                          val targetIp = if (isHost) "127.0.0.1" else hostIp
+                          val vSock = Socket(targetIp, voicePort)
+                          clientVoiceSocket = vSock
+
+                          val recorder = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, recBufSize)
+                          val player = AudioTrack.Builder()
+                              .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                              .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                              .setBufferSizeInBytes(playBufSize)
+                              .build()
+
+                          recorder.startRecording()
+                          player.play()
+
+                          // Playback thread
+                          Thread {
+                              val inBuf = ByteArray(1024)
+                              try {
+                                  val input = vSock.getInputStream()
+                                  while (inCall && connected) {
+                                      val n = input.read(inBuf)
+                                      if (n <= 0) break
+                                      player.write(inBuf, 0, n)
+                                  }
+                              } catch (_: Exception) {
+                              } finally {
+                                  try { player.stop(); player.release() } catch (_: Exception) {}
+                              }
+                          }.start()
+
+                          // Record & send loop
+                          val outBuf = ByteArray(1024)
+                          val output = vSock.getOutputStream()
+                          while (inCall && connected) {
+                              val n = recorder.read(outBuf, 0, outBuf.size)
+                              if (n > 0) output.write(outBuf, 0, n)
+                          }
+                          recorder.stop()
+                          recorder.release()
+                      } catch (e: Exception) {
+                          runOnUiThread {
+                              Toast.makeText(this, "Call ended: ${e.message}", Toast.LENGTH_SHORT).show()
+                              stopVoiceCall()
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun stopVoiceCall() {
+                  inCall = false
+                  try { clientVoiceSocket?.close() } catch (_: Exception) {}
+                  clientVoiceSocket = null
+                  runOnUiThread {
+                      callBtn.text = "START CALL"
+                      callBtn.setTextColor(Color.BLACK)
+                  }
+              }
+
+              private fun disconnectAll() {
+                  stopVoiceCall()
+                  if (connected && !isHost) {
+                      Thread { try { clientChatOut?.println("*** $username disconnected ***") } catch (_: Exception) {} }.start()
+                  }
+                  connected = false
+                  try { clientChatSocket?.close() } catch (_: Exception) {}
+                  try { chatServer?.close() } catch (_: Exception) {}
+                  try { voiceServer?.close() } catch (_: Exception) {}
+                  hostChatClients.clear()
+                  for (s in hostVoiceClients) { try { s.close() } catch (_: Exception) {} }
+                  hostVoiceClients.clear()
+
+                  runOnUiThread {
+                      chatLog.text = ""
+                      connectedLayout.visibility = View.GONE
+                      setupLayout.visibility = View.VISIBLE
+                  }
+              }
+
+              private fun showConnectedUi(status: String, showQr: Boolean) {
+                  setupLayout.visibility = View.GONE
+                  connectedLayout.visibility = View.VISIBLE
+                  statusText.text = status
+                  showQrBtn.visibility = if (showQr) View.VISIBLE else View.GONE
+              }
+
+              private fun showQrDialog() {
+                  try {
+                      val qrContent = "WHALERT|$hostIp|$chatPort|$voicePort"
+                      val bitmap = BarcodeEncoder().encodeBitmap(qrContent, BarcodeFormat.QR_CODE, 600, 600)
+                      val img = ImageView(this).apply { setImageBitmap(bitmap); setPadding(24, 24, 24, 24) }
+                      AlertDialog.Builder(this)
+                          .setTitle("Scan to Connect ($hostIp)")
+                          .setView(img)
+                          .setPositiveButton("Close", null)
+                          .show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "QR error: ${e.message}", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun appendLog(line: String) {
+                  runOnUiThread {
+                      chatLog.append("$line\n")
+                      chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+                  }
+              }
+
+              private fun getLocalIpAddress(): String? {
+                  val ifaces = NetworkInterface.getNetworkInterfaces()
+                  while (ifaces.hasMoreElements()) {
+                      val iface = ifaces.nextElement()
+                      if (!iface.isLoopback && iface.isUp) {
+                          val addrs = iface.inetAddresses
+                          while (addrs.hasMoreElements()) {
+                              val addr = addrs.nextElement()
+                              if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                                  return addr.hostAddress
+                              }
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              override fun onDestroy() {
+                  disconnectAll()
+                  super.onDestroy()
               }
           }
           EOF
