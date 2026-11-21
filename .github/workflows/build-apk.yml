@@ -311,7 +311,7 @@ jobs:
                               Thread {
                                   try {
                                       val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
-                                      var line: String?
+                                      var line: String? = null
                                       while (connected && reader.readLine().also { line = it } != null) {
                                           val msg = line!!
                                           appendLog(msg)
@@ -373,7 +373,7 @@ jobs:
                           }
                           clientChatOut?.println("*** $username joined ***")
                           val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
-                          var line: String?
+                          var line: String? = null
                           while (connected && reader.readLine().also { line = it } != null) {
                               appendLog(line!!)
                           }
