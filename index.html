@@ -24,6 +24,8 @@
     #deviceCount { font-size: 13px; color: #1976d2; font-weight: 600; margin-bottom: 8px; }
     #targetBox { margin-bottom: 10px; }
     #targetBox label { display: block; font-size: 12px; font-weight: 600; color: #555; margin-bottom: 4px; }
+    #incomingCallBox { background: #fff3e0; border: 2px solid #ef6c00; border-radius: 10px; padding: 12px; margin-bottom: 12px; text-align: center; }
+    #incomingCallText { font-weight: 700; color: #e65100; margin-bottom: 10px; font-size: 15px; }
     #chatBox { height: 260px; overflow-y: auto; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 14px; white-space: pre-wrap; }
     #qrContainer { text-align: center; margin: 12px 0; display: none; }
     #qrcode { display: inline-block; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
@@ -48,6 +50,15 @@
     <div id="connectedView" class="hidden">
       <div id="status">Connecting...</div>
       <div id="deviceCount" class="hidden">Connected devices: 0</div>
+
+      <!-- INCOMING CALL BANNER -->
+      <div id="incomingCallBox" class="hidden">
+        <div id="incomingCallText">Incoming Call...</div>
+        <div class="row" style="margin-bottom:0;">
+          <button class="btn-green" id="acceptCallBtn">ACCEPT</button>
+          <button class="btn-red" id="declineCallBtn">DECLINE</button>
+        </div>
+      </div>
 
       <!-- HOST TARGET SELECTOR -->
       <div id="targetBox" class="hidden">
@@ -86,10 +97,11 @@
     let username = "User";
     let hostId = "";
     let hostConn = null;
-    // Host stores objects: { peerId, name, conn }
     let clientList = [];
     let localStream = null;
     let activeCalls = [];
+    let pendingCall = null;
+    let ringInterval = null;
     let inCall = false;
     let callIsBroadcast = false;
     let audioCtx = null;
@@ -100,6 +112,10 @@
     const roomInput = document.getElementById("roomInput");
     const statusEl = document.getElementById("status");
     const deviceCountEl = document.getElementById("deviceCount");
+    const incomingCallBox = document.getElementById("incomingCallBox");
+    const incomingCallText = document.getElementById("incomingCallText");
+    const acceptCallBtn = document.getElementById("acceptCallBtn");
+    const declineCallBtn = document.getElementById("declineCallBtn");
     const targetBox = document.getElementById("targetBox");
     const targetSelect = document.getElementById("targetSelect");
     const chatBox = document.getElementById("chatBox");
@@ -140,7 +156,6 @@
         targetSelect.appendChild(opt);
       });
 
-      // Keep previous selection if that device is still connected
       if (clientList.some(c => c.peerId === prevSelection)) {
         targetSelect.value = prevSelection;
       } else {
@@ -192,6 +207,23 @@
       }
     }
 
+    function startRinging(callerName) {
+      stopRinging();
+      notifyUser("Incoming Warehouse Call", callerName + " is calling...", true);
+      ringInterval = setInterval(() => {
+        playAlertSound(true);
+        if (navigator.vibrate) navigator.vibrate([400, 150, 400]);
+      }, 2000);
+    }
+
+    function stopRinging() {
+      if (ringInterval) {
+        clearInterval(ringInterval);
+        ringInterval = null;
+      }
+      if (navigator.vibrate) navigator.vibrate(0);
+    }
+
     function appendLog(text) {
       chatBox.textContent += text + "\n";
       chatBox.scrollTop = chatBox.scrollHeight;
@@ -229,9 +261,8 @@
         clientList.push(clientEntry);
         updateDeviceListUI();
 
-        // Only auto-add to call if Host is in a broadcast call
         if (inCall && callIsBroadcast && localStream) {
-          const call = peer.call(conn.peer, localStream);
+          const call = peer.call(conn.peer, localStream, { metadata: { name: username } });
           attachCallEvents(call);
         }
 
@@ -336,25 +367,66 @@
       qrContainer.style.display = qrContainer.style.display === "none" ? "block" : "none";
     };
 
-    // --- VOICE CALL (BROADCAST OR SPECIFIC DEVICE) ---
+    // --- INCOMING CALL (ACCEPT / DECLINE) ---
     function setupIncomingCallHandler() {
       peer.on("call", async (call) => {
-        notifyUser("Incoming Warehouse Call", "Voice call connected", true);
-        try {
-          if (!localStream) {
-            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          }
+        const callerName = (call.metadata && call.metadata.name) ? call.metadata.name : "Warehouse Device";
+
+        // If already in a call, join automatically; otherwise show Accept/Decline banner
+        if (inCall && localStream) {
           call.answer(localStream);
           attachCallEvents(call);
-          inCall = true;
-          callBtn.textContent = "END CALL";
-          callBtn.className = "btn-red";
-          appendLog("*** Voice call connected ***");
-        } catch (err) {
-          alert("Microphone permission denied: " + err.message);
+          return;
         }
+
+        pendingCall = call;
+        incomingCallText.textContent = "Incoming call from " + callerName;
+        incomingCallBox.classList.remove("hidden");
+        startRinging(callerName);
+
+        call.on("close", () => {
+          if (pendingCall === call) {
+            stopRinging();
+            incomingCallBox.classList.add("hidden");
+            pendingCall = null;
+          }
+        });
       });
     }
+
+    acceptCallBtn.onclick = async () => {
+      initAlerts();
+      stopRinging();
+      incomingCallBox.classList.add("hidden");
+      if (!pendingCall) return;
+
+      const call = pendingCall;
+      pendingCall = null;
+      try {
+        if (!localStream) {
+          localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        call.answer(localStream);
+        attachCallEvents(call);
+        inCall = true;
+        callBtn.textContent = "END CALL";
+        callBtn.className = "btn-red";
+        appendLog("*** Call accepted ***");
+      } catch (err) {
+        alert("Microphone permission denied: " + err.message);
+        call.close();
+      }
+    };
+
+    declineCallBtn.onclick = () => {
+      stopRinging();
+      incomingCallBox.classList.add("hidden");
+      if (pendingCall) {
+        pendingCall.close();
+        pendingCall = null;
+      }
+      appendLog("*** Call declined ***");
+    };
 
     function attachCallEvents(call) {
       activeCalls.push(call);
@@ -373,6 +445,7 @@
       });
     }
 
+    // --- OUTGOING CALL ---
     callBtn.onclick = async () => {
       initAlerts();
       if (!inCall) {
@@ -386,17 +459,17 @@
             const target = targetSelect.value;
             if (target === "ALL") {
               callIsBroadcast = true;
-              appendLog("*** " + username + " started group voice call ***");
+              appendLog("*** " + username + " calling all devices... ***");
               clientList.forEach(c => {
-                const call = peer.call(c.peerId, localStream);
+                const call = peer.call(c.peerId, localStream, { metadata: { name: username } });
                 attachCallEvents(call);
               });
             } else {
               callIsBroadcast = false;
               const client = clientList.find(c => c.peerId === target);
               if (client) {
-                appendLog("*** Calling " + client.name + " (Private) ***");
-                const call = peer.call(client.peerId, localStream);
+                appendLog("*** Calling " + client.name + " (Private)... ***");
+                const call = peer.call(client.peerId, localStream, { metadata: { name: username } });
                 attachCallEvents(call);
               } else {
                 stopCall();
@@ -404,8 +477,8 @@
               }
             }
           } else {
-            appendLog("*** " + username + " started voice call ***");
-            const call = peer.call(hostId, localStream);
+            appendLog("*** Calling Host... ***");
+            const call = peer.call(hostId, localStream, { metadata: { name: username } });
             attachCallEvents(call);
           }
         } catch (err) {
@@ -417,6 +490,9 @@
     };
 
     function stopCall() {
+      stopRinging();
+      incomingCallBox.classList.add("hidden");
+      if (pendingCall) { pendingCall.close(); pendingCall = null; }
       inCall = false;
       callIsBroadcast = false;
       activeCalls.forEach(c => c.close());
