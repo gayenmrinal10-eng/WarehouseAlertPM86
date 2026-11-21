@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Warehouse Connect</title>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; padding: 16px; background: #f4f6f8; color: #111; }
+    .card { max-width: 500px; margin: 0 auto; background: #fff; padding: 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    h2 { margin: 0 0 8px; font-size: 20px; }
+    p.sub { margin: 0 0 16px; color: #555; font-size: 14px; }
+    input[type="text"] { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 16px; }
+    button { width: 100%; padding: 12px; margin-bottom: 8px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: #1976d2; color: #fff; }
+    .btn-green { background: #2e7d32; color: #fff; }
+    .btn-red { background: #d32f2f; color: #fff; }
+    .btn-gray { background: #e0e0e0; color: #111; }
+    .row { display: flex; gap: 8px; margin-bottom: 10px; }
+    .row button { margin-bottom: 0; flex: 1; padding: 10px 6px; font-size: 13px; }
+    #status { font-size: 14px; font-weight: 600; color: #1b5e20; margin-bottom: 10px; }
+    #chatBox { height: 280px; overflow-y: auto; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 14px; white-space: pre-wrap; }
+    #qrContainer { text-align: center; margin: 12px 0; display: none; }
+    #qrcode { display: inline-block; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>WAREHOUSE CONNECT</h2>
+    <p class="sub">Browser-based QR Chat &amp; Voice Call (No APK needed)</p>
+
+    <!-- SETUP SCREEN -->
+    <div id="setupView">
+      <input type="text" id="usernameInput" placeholder="Enter your username (e.g. Supervisor)" />
+      <button class="btn-primary" id="hostBtn">START AS HOST (SHOW QR)</button>
+      <div style="text-align:center; margin: 8px 0; color:#777; font-size:13px;">— OR —</div>
+      <input type="text" id="roomInput" placeholder="Enter Host ID (auto-filled when scanning QR)" />
+      <button class="btn-green" id="joinBtn">CONNECT TO HOST</button>
+    </div>
+
+    <!-- CONNECTED SCREEN -->
+    <div id="connectedView" class="hidden">
+      <div id="status">Connecting...</div>
+      <div class="row">
+        <button class="btn-gray" id="toggleQrBtn">SHOW QR</button>
+        <button class="btn-green" id="callBtn">START CALL</button>
+        <button class="btn-red" id="disconnectBtn">DISCONNECT</button>
+      </div>
+
+      <div id="qrContainer">
+        <div id="qrcode"></div>
+        <div id="hostIdLabel" style="font-size:12px; color:#555; margin-top:6px;"></div>
+      </div>
+
+      <div id="chatBox"></div>
+
+      <div class="row">
+        <input type="text" id="msgInput" placeholder="Type a message..." style="margin:0; flex:3;" />
+        <button class="btn-primary" id="sendBtn" style="flex:1;">SEND</button>
+      </div>
+    </div>
+  </div>
+
+  <audio id="remoteAudio" autoplay playsinline></audio>
+
+  <script>
+    let peer = null;
+    let isHost = false;
+    let username = "User";
+    let hostId = "";
+    let hostConn = null;
+    let clientConns = [];
+    let localStream = null;
+    let activeCalls = [];
+    let inCall = false;
+
+    const setupView = document.getElementById("setupView");
+    const connectedView = document.getElementById("connectedView");
+    const usernameInput = document.getElementById("usernameInput");
+    const roomInput = document.getElementById("roomInput");
+    const statusEl = document.getElementById("status");
+    const chatBox = document.getElementById("chatBox");
+    const qrContainer = document.getElementById("qrContainer");
+    const toggleQrBtn = document.getElementById("toggleQrBtn");
+    const callBtn = document.getElementById("callBtn");
+    const msgInput = document.getElementById("msgInput");
+    const remoteAudio = document.getElementById("remoteAudio");
+
+    // Check if opened via QR code (?host=...)
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("host")) {
+      roomInput.value = params.get("host");
+      usernameInput.placeholder = "Enter your name, then tap CONNECT";
+    }
+
+    function appendLog(text) {
+      chatBox.textContent += text + "\n";
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function showConnected(statusText, showQr) {
+      setupView.classList.add("hidden");
+      connectedView.classList.remove("hidden");
+      statusEl.textContent = statusText;
+      toggleQrBtn.style.display = showQr ? "block" : "none";
+    }
+
+    // --- HOST MODE ---
+    document.getElementById("hostBtn").onclick = () => {
+      username = usernameInput.value.trim() || "Host";
+      isHost = true;
+      const shortId = "wh-" + Math.random().toString(36).substring(2, 8);
+      peer = new Peer(shortId);
+
+      peer.on("open", (id) => {
+        hostId = id;
+        showConnected("HOST: " + username + " (" + id + ")", true);
+        appendLog("--- Hosting room: " + id + " ---");
+        const joinUrl = window.location.origin + window.location.pathname + "?host=" + encodeURIComponent(id);
+        document.getElementById("qrcode").innerHTML = "";
+        new QRCode(document.getElementById("qrcode"), { text: joinUrl, width: 200, height: 200 });
+        document.getElementById("hostIdLabel").textContent = "Scan QR or enter Host ID: " + id;
+        qrContainer.style.display = "block";
+      });
+
+      peer.on("connection", (conn) => {
+        clientConns.push(conn);
+        conn.on("data", (data) => {
+          appendLog(data);
+          clientConns.forEach(c => { if (c !== conn && c.open) c.send(data); });
+        });
+        conn.on("close", () => {
+          clientConns = clientConns.filter(c => c !== conn);
+        });
+      });
+
+      setupIncomingCallHandler();
+      peer.on("error", (err) => alert("Connection error: " + err.message));
+    };
+
+    // --- CLIENT MODE ---
+    document.getElementById("joinBtn").onclick = () => {
+      username = usernameInput.value.trim() || "Associate";
+      hostId = roomInput.value.trim();
+      if (!hostId) { alert("Scan the Host QR code or enter the Host ID first."); return; }
+      isHost = false;
+      peer = new Peer();
+
+      peer.on("open", () => {
+        hostConn = peer.connect(hostId);
+        hostConn.on("open", () => {
+          showConnected("Connected: " + username + " -> " + hostId, false);
+          appendLog("--- Connected to " + hostId + " ---");
+          hostConn.send("*** " + username + " joined ***");
+        });
+        hostConn.on("data", (data) => appendLog(data));
+        hostConn.on("close", () => {
+          appendLog("--- Host disconnected ---");
+          disconnectAll();
+        });
+      });
+
+      setupIncomingCallHandler();
+      peer.on("error", (err) => alert("Could not connect: " + err.message));
+    };
+
+    // --- CHAT ---
+    function sendMessage() {
+      const text = msgInput.value.trim();
+      if (!text) return;
+      msgInput.value = "";
+      const formatted = username + ": " + text;
+      appendLog(formatted);
+      if (isHost) {
+        clientConns.forEach(c => { if (c.open) c.send(formatted); });
+      } else if (hostConn && hostConn.open) {
+        hostConn.send(formatted);
+      }
+    }
+    document.getElementById("sendBtn").onclick = sendMessage;
+    msgInput.addEventListener("keypress", (e) => { if (e.key === "Enter") sendMessage(); });
+
+    // --- QR TOGGLE ---
+    toggleQrBtn.onclick = () => {
+      qrContainer.style.display = qrContainer.style.display === "none" ? "block" : "none";
+    };
+
+    // --- VOICE CALL ---
+    function setupIncomingCallHandler() {
+      peer.on("call", async (call) => {
+        try {
+          if (!localStream) {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          }
+          call.answer(localStream);
+          attachCallEvents(call);
+          inCall = true;
+          callBtn.textContent = "END CALL";
+          callBtn.className = "btn-red";
+          appendLog("*** Voice call connected ***");
+        } catch (err) {
+          alert("Microphone permission denied: " + err.message);
+        }
+      });
+    }
+
+    function attachCallEvents(call) {
+      activeCalls.push(call);
+      call.on("stream", (stream) => {
+        remoteAudio.srcObject = stream;
+      });
+      call.on("close", () => {
+        activeCalls = activeCalls.filter(c => c !== call);
+      });
+    }
+
+    callBtn.onclick = async () => {
+      if (!inCall) {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          inCall = true;
+          callBtn.textContent = "END CALL";
+          callBtn.className = "btn-red";
+          appendLog("*** " + username + " started voice call ***");
+
+          if (isHost) {
+            clientConns.forEach(c => {
+              const call = peer.call(c.peer, localStream);
+              attachCallEvents(call);
+            });
+          } else {
+            const call = peer.call(hostId, localStream);
+            attachCallEvents(call);
+          }
+        } catch (err) {
+          alert("Microphone error: " + err.message);
+        }
+      } else {
+        stopCall();
+      }
+    };
+
+    function stopCall() {
+      inCall = false;
+      activeCalls.forEach(c => c.close());
+      activeCalls = [];
+      if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+      }
+      remoteAudio.srcObject = null;
+      callBtn.textContent = "START CALL";
+      callBtn.className = "btn-green";
+      appendLog("*** Call ended ***");
+    }
+
+    // --- DISCONNECT ---
+    function disconnectAll() {
+      stopCall();
+      if (!isHost && hostConn && hostConn.open) {
+        hostConn.send("*** " + username + " disconnected ***");
+        hostConn.close();
+      }
+      clientConns.forEach(c => c.close());
+      clientConns = [];
+      if (peer) { peer.destroy(); peer = null; }
+      chatBox.textContent = "";
+      qrContainer.style.display = "none";
+      connectedView.classList.add("hidden");
+      setupView.classList.remove("hidden");
+    }
+
+    document.getElementById("disconnectBtn").onclick = disconnectAll;
+  </script>
+</body>
+        </html>
+        
