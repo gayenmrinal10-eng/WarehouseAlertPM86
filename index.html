@@ -20,7 +20,8 @@
     .btn-gray { background: #e0e0e0; color: #111; }
     .row { display: flex; gap: 8px; margin-bottom: 10px; }
     .row button { margin-bottom: 0; flex: 1; padding: 10px 6px; font-size: 13px; }
-    #status { font-size: 14px; font-weight: 600; color: #1b5e20; margin-bottom: 10px; }
+    #status { font-size: 14px; font-weight: 600; color: #1b5e20; margin-bottom: 4px; }
+    #deviceCount { font-size: 13px; color: #1976d2; font-weight: 600; margin-bottom: 10px; }
     #chatBox { height: 280px; overflow-y: auto; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 14px; white-space: pre-wrap; }
     #qrContainer { text-align: center; margin: 12px 0; display: none; }
     #qrcode { display: inline-block; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
@@ -30,7 +31,7 @@
 <body>
   <div class="card">
     <h2>WAREHOUSE CONNECT</h2>
-    <p class="sub">Browser-based QR Chat &amp; Voice Call (No APK needed)</p>
+    <p class="sub">Multi-Device QR Chat &amp; Voice Call</p>
 
     <!-- SETUP SCREEN -->
     <div id="setupView">
@@ -44,6 +45,8 @@
     <!-- CONNECTED SCREEN -->
     <div id="connectedView" class="hidden">
       <div id="status">Connecting...</div>
+      <div id="deviceCount" class="hidden">Connected devices: 0</div>
+
       <div class="row">
         <button class="btn-gray" id="toggleQrBtn">SHOW QR</button>
         <button class="btn-green" id="callBtn">START CALL</button>
@@ -64,7 +67,8 @@
     </div>
   </div>
 
-  <audio id="remoteAudio" autoplay playsinline></audio>
+  <!-- Container for multiple simultaneous voice streams -->
+  <div id="audioContainer" class="hidden"></div>
 
   <script>
     let peer = null;
@@ -76,24 +80,78 @@
     let localStream = null;
     let activeCalls = [];
     let inCall = false;
+    let audioCtx = null;
 
     const setupView = document.getElementById("setupView");
     const connectedView = document.getElementById("connectedView");
     const usernameInput = document.getElementById("usernameInput");
     const roomInput = document.getElementById("roomInput");
     const statusEl = document.getElementById("status");
+    const deviceCountEl = document.getElementById("deviceCount");
     const chatBox = document.getElementById("chatBox");
     const qrContainer = document.getElementById("qrContainer");
     const toggleQrBtn = document.getElementById("toggleQrBtn");
     const callBtn = document.getElementById("callBtn");
     const msgInput = document.getElementById("msgInput");
-    const remoteAudio = document.getElementById("remoteAudio");
+    const audioContainer = document.getElementById("audioContainer");
 
-    // Check if opened via QR code (?host=...)
     const params = new URLSearchParams(window.location.search);
     if (params.get("host")) {
       roomInput.value = params.get("host");
       usernameInput.placeholder = "Enter your name, then tap CONNECT";
+    }
+
+    function updateDeviceCount() {
+      if (isHost) {
+        deviceCountEl.classList.remove("hidden");
+        deviceCountEl.textContent = "Connected devices: " + clientConns.length;
+      } else {
+        deviceCountEl.classList.add("hidden");
+      }
+    }
+
+    function initAlerts() {
+      if (!audioCtx) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) audioCtx = new AudioContext();
+      }
+      if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
+    }
+
+    function playAlertSound(isCall) {
+      if (!audioCtx) return;
+      try {
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        const now = audioCtx.currentTime;
+        const notes = isCall ? [880, 1100, 880, 1100] : [800];
+        notes.forEach((freq, i) => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(freq, now + i * 0.18);
+          gain.gain.setValueAtTime(0.4, now + i * 0.18);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + i * 0.18 + 0.15);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start(now + i * 0.18);
+          osc.stop(now + i * 0.18 + 0.16);
+        });
+      } catch (_) {}
+    }
+
+    function notifyUser(title, body, isCall) {
+      playAlertSound(isCall);
+      if (navigator.vibrate) {
+        navigator.vibrate(isCall ? [400, 150, 400, 150, 400] : [200, 100, 200]);
+      }
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification(title, { body: body, requireInteraction: isCall });
+        } catch (_) {}
+      }
     }
 
     function appendLog(text) {
@@ -106,10 +164,12 @@
       connectedView.classList.remove("hidden");
       statusEl.textContent = statusText;
       toggleQrBtn.style.display = showQr ? "block" : "none";
+      updateDeviceCount();
     }
 
-    // --- HOST MODE ---
+    // --- HOST MODE (SUPPORTS MULTIPLE DEVICES) ---
     document.getElementById("hostBtn").onclick = () => {
+      initAlerts();
       username = usernameInput.value.trim() || "Host";
       isHost = true;
       const shortId = "wh-" + Math.random().toString(36).substring(2, 8);
@@ -122,18 +182,29 @@
         const joinUrl = window.location.origin + window.location.pathname + "?host=" + encodeURIComponent(id);
         document.getElementById("qrcode").innerHTML = "";
         new QRCode(document.getElementById("qrcode"), { text: joinUrl, width: 200, height: 200 });
-        document.getElementById("hostIdLabel").textContent = "Scan QR or enter Host ID: " + id;
+        document.getElementById("hostIdLabel").textContent = "Scan QR with multiple devices or enter ID: " + id;
         qrContainer.style.display = "block";
       });
 
       peer.on("connection", (conn) => {
         clientConns.push(conn);
+        updateDeviceCount();
+
+        // If a voice call is already active, automatically add the new device
+        if (inCall && localStream) {
+          const call = peer.call(conn.peer, localStream);
+          attachCallEvents(call);
+        }
+
         conn.on("data", (data) => {
           appendLog(data);
+          notifyUser("Warehouse Message", data, false);
           clientConns.forEach(c => { if (c !== conn && c.open) c.send(data); });
         });
+
         conn.on("close", () => {
           clientConns = clientConns.filter(c => c !== conn);
+          updateDeviceCount();
         });
       });
 
@@ -143,6 +214,7 @@
 
     // --- CLIENT MODE ---
     document.getElementById("joinBtn").onclick = () => {
+      initAlerts();
       username = usernameInput.value.trim() || "Associate";
       hostId = roomInput.value.trim();
       if (!hostId) { alert("Scan the Host QR code or enter the Host ID first."); return; }
@@ -156,7 +228,10 @@
           appendLog("--- Connected to " + hostId + " ---");
           hostConn.send("*** " + username + " joined ***");
         });
-        hostConn.on("data", (data) => appendLog(data));
+        hostConn.on("data", (data) => {
+          appendLog(data);
+          notifyUser("Warehouse Message", data, false);
+        });
         hostConn.on("close", () => {
           appendLog("--- Host disconnected ---");
           disconnectAll();
@@ -188,9 +263,10 @@
       qrContainer.style.display = qrContainer.style.display === "none" ? "block" : "none";
     };
 
-    // --- VOICE CALL ---
+    // --- MULTI-DEVICE VOICE CALL ---
     function setupIncomingCallHandler() {
       peer.on("call", async (call) => {
+        notifyUser("Incoming Warehouse Call", "Voice call connected", true);
         try {
           if (!localStream) {
             localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -209,15 +285,23 @@
 
     function attachCallEvents(call) {
       activeCalls.push(call);
+      const audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      audioEl.playsInline = true;
+      audioContainer.appendChild(audioEl);
+
       call.on("stream", (stream) => {
-        remoteAudio.srcObject = stream;
+        audioEl.srcObject = stream;
       });
       call.on("close", () => {
+        audioEl.srcObject = null;
+        audioEl.remove();
         activeCalls = activeCalls.filter(c => c !== call);
       });
     }
 
     callBtn.onclick = async () => {
+      initAlerts();
       if (!inCall) {
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -247,11 +331,11 @@
       inCall = false;
       activeCalls.forEach(c => c.close());
       activeCalls = [];
+      audioContainer.innerHTML = "";
       if (localStream) {
         localStream.getTracks().forEach(t => t.stop());
         localStream = null;
       }
-      remoteAudio.srcObject = null;
       callBtn.textContent = "START CALL";
       callBtn.className = "btn-green";
       appendLog("*** Call ended ***");
@@ -269,6 +353,7 @@
       if (peer) { peer.destroy(); peer = null; }
       chatBox.textContent = "";
       qrContainer.style.display = "none";
+      deviceCountEl.classList.add("hidden");
       connectedView.classList.add("hidden");
       setupView.classList.remove("hidden");
     }
@@ -276,5 +361,4 @@
     document.getElementById("disconnectBtn").onclick = disconnectAll;
   </script>
 </body>
-        </html>
-        
+</html>
