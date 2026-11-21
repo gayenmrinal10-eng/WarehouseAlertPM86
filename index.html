@@ -12,7 +12,7 @@
     .card { max-width: 500px; margin: 0 auto; background: #fff; padding: 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     h2 { margin: 0 0 8px; font-size: 20px; }
     p.sub { margin: 0 0 16px; color: #555; font-size: 14px; }
-    input[type="text"] { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 16px; }
+    input[type="text"], select { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 15px; background: #fff; }
     button { width: 100%; padding: 12px; margin-bottom: 8px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; }
     .btn-primary { background: #1976d2; color: #fff; }
     .btn-green { background: #2e7d32; color: #fff; }
@@ -21,8 +21,10 @@
     .row { display: flex; gap: 8px; margin-bottom: 10px; }
     .row button { margin-bottom: 0; flex: 1; padding: 10px 6px; font-size: 13px; }
     #status { font-size: 14px; font-weight: 600; color: #1b5e20; margin-bottom: 4px; }
-    #deviceCount { font-size: 13px; color: #1976d2; font-weight: 600; margin-bottom: 10px; }
-    #chatBox { height: 280px; overflow-y: auto; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 14px; white-space: pre-wrap; }
+    #deviceCount { font-size: 13px; color: #1976d2; font-weight: 600; margin-bottom: 8px; }
+    #targetBox { margin-bottom: 10px; }
+    #targetBox label { display: block; font-size: 12px; font-weight: 600; color: #555; margin-bottom: 4px; }
+    #chatBox { height: 260px; overflow-y: auto; background: #f8f9fa; border: 1px solid #ddd; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 14px; white-space: pre-wrap; }
     #qrContainer { text-align: center; margin: 12px 0; display: none; }
     #qrcode { display: inline-block; padding: 10px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
     .hidden { display: none; }
@@ -46,6 +48,14 @@
     <div id="connectedView" class="hidden">
       <div id="status">Connecting...</div>
       <div id="deviceCount" class="hidden">Connected devices: 0</div>
+
+      <!-- HOST TARGET SELECTOR -->
+      <div id="targetBox" class="hidden">
+        <label for="targetSelect">Send Message / Call Target:</label>
+        <select id="targetSelect">
+          <option value="ALL">All Connected Devices</option>
+        </select>
+      </div>
 
       <div class="row">
         <button class="btn-gray" id="toggleQrBtn">SHOW QR</button>
@@ -76,10 +86,12 @@
     let username = "User";
     let hostId = "";
     let hostConn = null;
-    let clientConns = [];
+    // Host stores objects: { peerId, name, conn }
+    let clientList = [];
     let localStream = null;
     let activeCalls = [];
     let inCall = false;
+    let callIsBroadcast = false;
     let audioCtx = null;
 
     const setupView = document.getElementById("setupView");
@@ -88,6 +100,8 @@
     const roomInput = document.getElementById("roomInput");
     const statusEl = document.getElementById("status");
     const deviceCountEl = document.getElementById("deviceCount");
+    const targetBox = document.getElementById("targetBox");
+    const targetSelect = document.getElementById("targetSelect");
     const chatBox = document.getElementById("chatBox");
     const qrContainer = document.getElementById("qrContainer");
     const toggleQrBtn = document.getElementById("toggleQrBtn");
@@ -101,12 +115,36 @@
       usernameInput.placeholder = "Enter your name, then tap CONNECT";
     }
 
-    function updateDeviceCount() {
-      if (isHost) {
-        deviceCountEl.classList.remove("hidden");
-        deviceCountEl.textContent = "Connected devices: " + clientConns.length;
-      } else {
+    function updateDeviceListUI() {
+      if (!isHost) {
         deviceCountEl.classList.add("hidden");
+        targetBox.classList.add("hidden");
+        return;
+      }
+      deviceCountEl.classList.remove("hidden");
+      targetBox.classList.remove("hidden");
+      deviceCountEl.textContent = "Connected devices: " + clientList.length;
+
+      const prevSelection = targetSelect.value;
+      targetSelect.innerHTML = "";
+
+      const allOpt = document.createElement("option");
+      allOpt.value = "ALL";
+      allOpt.textContent = "All Connected Devices (" + clientList.length + ")";
+      targetSelect.appendChild(allOpt);
+
+      clientList.forEach(client => {
+        const opt = document.createElement("option");
+        opt.value = client.peerId;
+        opt.textContent = client.name + " (Private)";
+        targetSelect.appendChild(opt);
+      });
+
+      // Keep previous selection if that device is still connected
+      if (clientList.some(c => c.peerId === prevSelection)) {
+        targetSelect.value = prevSelection;
+      } else {
+        targetSelect.value = "ALL";
       }
     }
 
@@ -164,10 +202,10 @@
       connectedView.classList.remove("hidden");
       statusEl.textContent = statusText;
       toggleQrBtn.style.display = showQr ? "block" : "none";
-      updateDeviceCount();
+      updateDeviceListUI();
     }
 
-    // --- HOST MODE (SUPPORTS MULTIPLE DEVICES) ---
+    // --- HOST MODE ---
     document.getElementById("hostBtn").onclick = () => {
       initAlerts();
       username = usernameInput.value.trim() || "Host";
@@ -187,24 +225,40 @@
       });
 
       peer.on("connection", (conn) => {
-        clientConns.push(conn);
-        updateDeviceCount();
+        const clientEntry = { peerId: conn.peer, name: "Scanner", conn: conn };
+        clientList.push(clientEntry);
+        updateDeviceListUI();
 
-        // If a voice call is already active, automatically add the new device
-        if (inCall && localStream) {
+        // Only auto-add to call if Host is in a broadcast call
+        if (inCall && callIsBroadcast && localStream) {
           const call = peer.call(conn.peer, localStream);
           attachCallEvents(call);
         }
 
         conn.on("data", (data) => {
-          appendLog(data);
-          notifyUser("Warehouse Message", data, false);
-          clientConns.forEach(c => { if (c !== conn && c.open) c.send(data); });
+          if (data && typeof data === "object") {
+            if (data.type === "join") {
+              clientEntry.name = data.name || "Scanner";
+              updateDeviceListUI();
+              const joinMsg = "*** " + clientEntry.name + " joined ***";
+              appendLog(joinMsg);
+              clientList.forEach(c => { if (c.conn !== conn && c.conn.open) c.conn.send({ type: "system", text: joinMsg }); });
+            } else if (data.type === "chat") {
+              const formatted = data.sender + ": " + data.text;
+              appendLog(formatted);
+              notifyUser("Warehouse Message", formatted, false);
+              clientList.forEach(c => { if (c.conn !== conn && c.conn.open) c.conn.send({ type: "chat", text: formatted }); });
+            } else if (data.type === "leave") {
+              const leaveMsg = "*** " + clientEntry.name + " disconnected ***";
+              appendLog(leaveMsg);
+              clientList.forEach(c => { if (c.conn !== conn && c.conn.open) c.conn.send({ type: "system", text: leaveMsg }); });
+            }
+          }
         });
 
         conn.on("close", () => {
-          clientConns = clientConns.filter(c => c !== conn);
-          updateDeviceCount();
+          clientList = clientList.filter(c => c.peerId !== conn.peer);
+          updateDeviceListUI();
         });
       });
 
@@ -226,11 +280,15 @@
         hostConn.on("open", () => {
           showConnected("Connected: " + username + " -> " + hostId, false);
           appendLog("--- Connected to " + hostId + " ---");
-          hostConn.send("*** " + username + " joined ***");
+          hostConn.send({ type: "join", name: username });
         });
         hostConn.on("data", (data) => {
-          appendLog(data);
-          notifyUser("Warehouse Message", data, false);
+          if (data && typeof data === "object" && data.text) {
+            appendLog(data.text);
+            if (data.type === "chat" || data.type === "private") {
+              notifyUser(data.type === "private" ? "Private Message" : "Warehouse Message", data.text, false);
+            }
+          }
         });
         hostConn.on("close", () => {
           appendLog("--- Host disconnected ---");
@@ -242,17 +300,32 @@
       peer.on("error", (err) => alert("Could not connect: " + err.message));
     };
 
-    // --- CHAT ---
+    // --- CHAT (BROADCAST OR PRIVATE) ---
     function sendMessage() {
       const text = msgInput.value.trim();
       if (!text) return;
       msgInput.value = "";
-      const formatted = username + ": " + text;
-      appendLog(formatted);
+
       if (isHost) {
-        clientConns.forEach(c => { if (c.open) c.send(formatted); });
+        const target = targetSelect.value;
+        if (target === "ALL") {
+          const formatted = username + ": " + text;
+          appendLog(formatted);
+          clientList.forEach(c => {
+            if (c.conn.open) c.conn.send({ type: "chat", text: formatted });
+          });
+        } else {
+          const client = clientList.find(c => c.peerId === target);
+          if (client && client.conn.open) {
+            appendLog("[Private to " + client.name + "] " + username + ": " + text);
+            client.conn.send({ type: "private", text: "[Private] " + username + ": " + text });
+          } else {
+            appendLog("--- Selected device is no longer connected ---");
+          }
+        }
       } else if (hostConn && hostConn.open) {
-        hostConn.send(formatted);
+        appendLog(username + ": " + text);
+        hostConn.send({ type: "chat", sender: username, text: text });
       }
     }
     document.getElementById("sendBtn").onclick = sendMessage;
@@ -263,7 +336,7 @@
       qrContainer.style.display = qrContainer.style.display === "none" ? "block" : "none";
     };
 
-    // --- MULTI-DEVICE VOICE CALL ---
+    // --- VOICE CALL (BROADCAST OR SPECIFIC DEVICE) ---
     function setupIncomingCallHandler() {
       peer.on("call", async (call) => {
         notifyUser("Incoming Warehouse Call", "Voice call connected", true);
@@ -308,14 +381,30 @@
           inCall = true;
           callBtn.textContent = "END CALL";
           callBtn.className = "btn-red";
-          appendLog("*** " + username + " started voice call ***");
 
           if (isHost) {
-            clientConns.forEach(c => {
-              const call = peer.call(c.peer, localStream);
-              attachCallEvents(call);
-            });
+            const target = targetSelect.value;
+            if (target === "ALL") {
+              callIsBroadcast = true;
+              appendLog("*** " + username + " started group voice call ***");
+              clientList.forEach(c => {
+                const call = peer.call(c.peerId, localStream);
+                attachCallEvents(call);
+              });
+            } else {
+              callIsBroadcast = false;
+              const client = clientList.find(c => c.peerId === target);
+              if (client) {
+                appendLog("*** Calling " + client.name + " (Private) ***");
+                const call = peer.call(client.peerId, localStream);
+                attachCallEvents(call);
+              } else {
+                stopCall();
+                alert("Selected device is no longer connected.");
+              }
+            }
           } else {
+            appendLog("*** " + username + " started voice call ***");
             const call = peer.call(hostId, localStream);
             attachCallEvents(call);
           }
@@ -329,6 +418,7 @@
 
     function stopCall() {
       inCall = false;
+      callIsBroadcast = false;
       activeCalls.forEach(c => c.close());
       activeCalls = [];
       audioContainer.innerHTML = "";
@@ -345,15 +435,16 @@
     function disconnectAll() {
       stopCall();
       if (!isHost && hostConn && hostConn.open) {
-        hostConn.send("*** " + username + " disconnected ***");
+        hostConn.send({ type: "leave" });
         hostConn.close();
       }
-      clientConns.forEach(c => c.close());
-      clientConns = [];
+      clientList.forEach(c => c.conn.close());
+      clientList = [];
       if (peer) { peer.destroy(); peer = null; }
       chatBox.textContent = "";
       qrContainer.style.display = "none";
       deviceCountEl.classList.add("hidden");
+      targetBox.classList.add("hidden");
       connectedView.classList.add("hidden");
       setupView.classList.remove("hidden");
     }
@@ -361,4 +452,5 @@
     document.getElementById("disconnectBtn").onclick = disconnectAll;
   </script>
 </body>
-</html>
+  </html>
+  
